@@ -1,0 +1,9 @@
+services:
+  ffmpeg_svc:
+    build: .
+    container_name: ffmpeg_svc
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8010:8010"   # доступ только локально (идеально под SSH-туннель)
+    env_file:
+      - .env
