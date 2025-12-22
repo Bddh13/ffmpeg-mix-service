@@ -1,5 +1,5 @@
 # app.py
-# FastAPI microservice: trims background music to voice length (+ optional fade out),
+# FastAPI microservice: trims background music to (voice + EXTRA_MUSIC_MS),
 # mixes voice + music, muxes into video, returns MP4.
 #
 # Important:
@@ -29,6 +29,9 @@ HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT_SEC", "300"))
 MAX_DOWNLOAD_MB = int(os.getenv("MAX_DOWNLOAD_MB", "500"))
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
 
+# NEW: music plays 1 second longer than voice by default
+EXTRA_MUSIC_MS = int(os.getenv("EXTRA_MUSIC_MS", "1000"))
+
 app = FastAPI(title=APP_NAME)
 
 
@@ -36,7 +39,7 @@ class MixRequest(BaseModel):
     video_url: str = Field(..., description="Public URL to input MP4 video")
     voice_url: Optional[str] = Field(None, description="Public URL to voice audio (optional)")
     music_url: str = Field(..., description="Public URL to background music audio")
-    duration_ms: int = Field(..., ge=1, description="Voice duration in milliseconds (used to trim music/video)")
+    duration_ms: int = Field(..., ge=1, description="Voice duration in milliseconds")
     music_volume: float = Field(0.18, ge=0.0, le=2.0, description="Background music volume multiplier")
     fade_out_ms: int = Field(1000, ge=0, description="Fade out duration for music in ms")
     voice_volume: float = Field(1.0, ge=0.0, le=3.0, description="Voice volume multiplier")
@@ -107,6 +110,13 @@ async def mix(req: MixRequest, x_api_key: Optional[str] = Header(default=None, a
     if voice_ms <= 0:
         raise HTTPException(status_code=400, detail="duration_ms must be > 0")
 
+    # total duration = voice + extra music tail
+    extra_ms = max(int(EXTRA_MUSIC_MS), 0)
+    total_ms = voice_ms + extra_ms
+
+    voice_s = max(voice_ms / 1000.0, 0.001)
+    total_s = max(total_ms / 1000.0, 0.001)
+
     tmpdir = tempfile.mkdtemp(prefix=TMP_PREFIX)
     tmp = Path(tmpdir)
 
@@ -114,7 +124,7 @@ async def mix(req: MixRequest, x_api_key: Optional[str] = Header(default=None, a
     music_in = tmp / "music.mp3"
     voice_in = tmp / "voice.mp3"
 
-    # IMPORTANT: trimmed music is AAC in MP4 container, NOT .mp3
+    # Trimmed music is AAC in MP4 container
     music_trim = tmp / "music_trim.m4a"
     out_path = tmp / "out.mp4"
 
@@ -124,20 +134,19 @@ async def mix(req: MixRequest, x_api_key: Optional[str] = Header(default=None, a
         if req.voice_url:
             await _download_to(voice_in, req.voice_url)
 
-        dur_s = max(voice_ms / 1000.0, 0.001)
         fade_s = max(req.fade_out_ms / 1000.0, 0.0)
-        fade_start = max(dur_s - fade_s, 0.0)
+        fade_start = max(total_s - fade_s, 0.0)
 
-        music_af = f"atrim=0:{dur_s},asetpts=PTS-STARTPTS,volume={req.music_volume}"
+        # NEW: trim music to total_s (voice + 1s)
+        music_af = f"atrim=0:{total_s},asetpts=PTS-STARTPTS,volume={req.music_volume}"
         if fade_s > 0:
             music_af += f",afade=t=out:st={fade_start}:d={fade_s}"
 
-        # Trim music into .m4a (AAC in MP4 container)
         _run_ffmpeg([
             "-i", str(music_in),
             "-map_metadata", "-1",
             "-filter:a", music_af,
-            "-t", f"{dur_s}",
+            "-t", f"{total_s}",
             "-vn",
             "-c:a", "aac",
             "-b:a", "192k",
@@ -146,11 +155,11 @@ async def mix(req: MixRequest, x_api_key: Optional[str] = Header(default=None, a
         ])
 
         if req.voice_url:
-            # External voice + music mix -> mux into video
+            # NEW: amix duration=longest so music can continue after voice ends, then trim to total_s
             amix_filter = (
                 f"[1:a]volume={req.voice_volume},asetpts=PTS-STARTPTS[voice];"
                 f"[2:a]asetpts=PTS-STARTPTS[music];"
-                f"[voice][music]amix=inputs=2:duration=first:dropout_transition=0,atrim=0:{dur_s}[aout]"
+                f"[voice][music]amix=inputs=2:duration=longest:dropout_transition=0,atrim=0:{total_s}[aout]"
             )
 
             _run_ffmpeg([
@@ -160,7 +169,7 @@ async def mix(req: MixRequest, x_api_key: Optional[str] = Header(default=None, a
                 "-filter_complex", amix_filter,
                 "-map", "0:v:0",
                 "-map", "[aout]",
-                "-t", f"{dur_s}",
+                "-t", f"{total_s}",          # NEW: output duration is total_s
                 "-c:v", "copy",
                 "-c:a", "aac",
                 "-b:a", "192k",
@@ -169,10 +178,11 @@ async def mix(req: MixRequest, x_api_key: Optional[str] = Header(default=None, a
             ])
         else:
             # Mix existing video audio with trimmed music.
+            # NEW: duration=longest, then trim to total_s
             mix_filter = (
                 f"[1:a]asetpts=PTS-STARTPTS[music];"
                 f"[0:a]volume=1.0,asetpts=PTS-STARTPTS[orig];"
-                f"[orig][music]amix=inputs=2:duration=first:dropout_transition=0,atrim=0:{dur_s}[aout]"
+                f"[orig][music]amix=inputs=2:duration=longest:dropout_transition=0,atrim=0:{total_s}[aout]"
             )
 
             try:
@@ -182,7 +192,7 @@ async def mix(req: MixRequest, x_api_key: Optional[str] = Header(default=None, a
                     "-filter_complex", mix_filter,
                     "-map", "0:v:0",
                     "-map", "[aout]",
-                    "-t", f"{dur_s}",
+                    "-t", f"{total_s}",        # NEW
                     "-c:v", "copy",
                     "-c:a", "aac",
                     "-b:a", "192k",
@@ -196,7 +206,7 @@ async def mix(req: MixRequest, x_api_key: Optional[str] = Header(default=None, a
                     "-i", str(music_trim),
                     "-map", "0:v:0",
                     "-map", "1:a:0",
-                    "-t", f"{dur_s}",
+                    "-t", f"{total_s}",        # NEW
                     "-c:v", "copy",
                     "-c:a", "aac",
                     "-b:a", "192k",
